@@ -68,6 +68,7 @@
 const char* xd3_mainerror(int err_num);
 
 #include "xdelta3-internal.h"
+#include <fcntl.h>
 
 int
 xsnprintf_func (char *str, size_t n, const char *fmt, ...)
@@ -447,7 +448,13 @@ void* main_bufalloc (size_t size) {
 #if XD3_WIN32
   return VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 #else
-  return main_malloc1(size);
+  void *buf;
+  int ret;
+  ret = posix_memalign(&buf, 512, size);
+  if (option_verbose > 1)
+    XPR(NT "getting buf at %p (%lx)\n", buf, size);
+  if (ret != 0) { XPR(NT "posix_memalign failed: %lx\n", size); }
+  return buf;
 #endif
 }
 
@@ -787,6 +794,7 @@ main_file_init (main_file *xfile)
 #if XD3_WIN32
   xfile->file = INVALID_HANDLE_VALUE;
 #endif
+  xfile->direct = 0;
 }
 
 int
@@ -879,7 +887,19 @@ main_file_open (main_file *xfile, const char* name, int mode)
 
 #elif XD3_POSIX
   /* TODO: Should retry this call if interrupted, similar to read/write */
-  if ((ret = open (name, XOPEN_POSIX, XOPEN_MODE)) < 0)
+  /* Find the file size to detect access of last incomplete block */
+  if ((ret = open (name, XOPEN_POSIX, XOPEN_MODE)) >= 0) {
+      xfile->size = lseek(ret, 0, SEEK_END);
+      lseek(ret, 0, SEEK_SET);
+      close(ret);
+  }
+
+  /* Open in direct mode if direct IO enabled */
+  if (xfile->direct)
+    ret = open (name, XOPEN_POSIX | O_DIRECT, XOPEN_MODE);
+  else
+    ret = open (name, XOPEN_POSIX, XOPEN_MODE);
+  if (ret < 0)
     {
       ret = get_errno ();
     }
@@ -1044,6 +1064,10 @@ main_file_read (main_file  *ifile,
 {
   int ret = 0;
   IF_DEBUG1(DP(RINT "[main] read %s up to %"Z"u\n", ifile->filename, size));
+#if XD3_POSIX
+  main_file *xfile = ifile;
+  off_t curr = lseek(ifile->file, 0, SEEK_CUR);
+#endif
 
 #if XD3_STDIO
   size_t result;
@@ -1060,6 +1084,20 @@ main_file_read (main_file  *ifile,
     }
 
 #elif XD3_POSIX
+  /* Check for incomplete last block and return using normal read */
+  if (ifile->direct) {
+    if ((ifile->size != 0) && ((curr + size) > ifile->size)) {
+      close(ifile->file);
+      ret = open (ifile->filename, XOPEN_POSIX, XOPEN_MODE);
+      IF_DEBUG1(DP(RINT  "returning remainder with normal read: %lx\n", ifile->size - curr));
+      lseek(ret, curr, SEEK_SET);
+      ret = xd3_posix_io (ret, buf, size, (xd3_posix_func*) &read, nread);
+      close(ret);
+      ifile->file = open(ifile->filename, XOPEN_POSIX | O_DIRECT, XOPEN_MODE);
+      return ret;
+    }
+  }
+
   ret = xd3_posix_io (ifile->file, buf, size, (xd3_posix_func*) &read, nread);
 #elif XD3_WIN32
   ret = xd3_win32_io (ifile->file, buf, size, 1 /* is_read */, nread);
@@ -2436,13 +2474,20 @@ main_secondary_decompress_check (main_file  *file,
   usize_t i;
   usize_t try_read = xd3_min (input_size, XD3_ALLOCSIZE);
   size_t  check_nread = 0;
-  uint8_t check_buf[XD3_ALLOCSIZE];  /* TODO: heap allocate */
+  uint8_t *check_buf;
+  ret = posix_memalign((void **)&check_buf, 512, XD3_ALLOCSIZE);
+  if (ret != 0) {
+    XPR(NT "could not get memory buffer\n");
+    return ret;
+  }
+  IF_DEBUG1(DP(RINT "getting sbuf at %p (%d)\n", (void *)check_buf, XD3_ALLOCSIZE));
   const main_extcomp *decompressor = NULL;
 
   if ((ret = main_file_read (file, check_buf,
 			     try_read,
 			     & check_nread, "input read failed")))
     {
+      free(check_buf);
       return ret;
     }
 
@@ -2511,10 +2556,12 @@ main_secondary_decompress_check (main_file  *file,
 	}
 
       file->size_known = 0;
-      return main_input_decompress_setup (decompressor, file,
+      ret = main_input_decompress_setup (decompressor, file,
 					  input_buf, input_size,
 					  check_buf, XD3_ALLOCSIZE,
 					  check_nread, nread);
+      free(check_buf);
+      return ret;
     }
 
   /* Now read the rest of the input block. */
@@ -2533,6 +2580,7 @@ main_secondary_decompress_check (main_file  *file,
 
   (*nread) += check_nread;
 
+  free(check_buf);
   return 0;
 }
 
@@ -3574,7 +3622,7 @@ int main (int argc, char **argv)
 #endif
 {
   static const char *flags =
-    "0123456789cdefhnqvDFJNORVs:m:B:C:E:I:L:O:M:P:W:A::S::";
+    "0123456789cdefhinqvDFJNORVs:m:B:C:E:I:L:O:M:P:W:A::S::";
   xd3_cmd cmd;
   main_file ifile;
   main_file ofile;
@@ -3756,6 +3804,7 @@ int main (int argc, char **argv)
 	  break;
 #endif
 	case 'v': option_verbose += 1; option_quiet = 0; break;
+	case 'i': ifile.direct = 1; sfile.direct = 1; break;
 	case 'q': option_quiet = 1; option_verbose = 0; break;
 	case 'c': option_stdout = 1; break;
 	case 'd':
@@ -4033,6 +4082,7 @@ main_help (void)
   XPR(NTR "   -F           force the external-compression subprocess\n");
 #endif
   XPR(NTR "   -h           show help\n");
+  XPR(NTR "   -i           use direct IO (window must be multiple of disk buffer size)\n");
   XPR(NTR "   -q           be quiet\n");
   XPR(NTR "   -v           be verbose (max 2)\n");
   XPR(NTR "   -V           show version\n");

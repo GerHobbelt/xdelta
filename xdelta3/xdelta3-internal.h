@@ -130,6 +130,8 @@ struct _main_file
   int                 flags;         /* RD_FIRST, RD_NONEXTERNAL, ... */
   xoff_t              nread;         /* for input position */
   xoff_t              nwrite;        /* for output position */
+  xoff_t              size;          /* size of the file */
+  uint8_t             direct;        /* use direct IO */
   uint8_t            *snprintf_buf;  /* internal snprintf() use */
   int                 size_known;    /* Set by main_set_souze */
   xoff_t              source_position;  /* for avoiding seek in getblk_func */
