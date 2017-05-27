@@ -795,6 +795,7 @@ main_file_init (main_file *xfile)
   xfile->file = INVALID_HANDLE_VALUE;
 #endif
   xfile->direct = 0;
+  xfile->size   = 0;
 }
 
 int
@@ -1086,7 +1087,7 @@ main_file_read (main_file  *ifile,
 #elif XD3_POSIX
   /* Check for incomplete last block and return using normal read */
   if (ifile->direct) {
-    if ((ifile->size != 0) && ((curr + size) > ifile->size)) {
+    if ((ifile->size != 0) && (size != 0) && ((curr + size) >= ifile->size)) {
       close(ifile->file);
       ret = open (ifile->filename, XOPEN_POSIX, XOPEN_MODE);
       IF_DEBUG1(DP(RINT  "returning remainder with normal read: %lx\n", ifile->size - curr));
@@ -1094,6 +1095,7 @@ main_file_read (main_file  *ifile,
       ret = xd3_posix_io (ret, buf, size, (xd3_posix_func*) &read, nread);
       close(ret);
       ifile->file = open(ifile->filename, XOPEN_POSIX | O_DIRECT, XOPEN_MODE);
+      lseek(ifile->file, 0, SEEK_END);
       return ret;
     }
   }
